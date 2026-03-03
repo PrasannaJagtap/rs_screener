@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+*.pyc
+logs/
+results/manual/*.csv
+results/manual/*.xlsx
+cache/
+.screener_config.json
+progress_*.json
