@@ -18,6 +18,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import os, sys, subprocess, glob, json
 from datetime import datetime
+from dotenv import load_dotenv
 
 # ── Paths ──────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +26,8 @@ RESULTS_DIR = os.path.join(BASE_DIR, "results", "manual")
 LOG_DIR     = os.path.join(BASE_DIR, "logs")
 CORE_DIR    = os.path.join(BASE_DIR, "core")
 sys.path.insert(0, BASE_DIR)
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 from core.data_fetcher  import fetch_stock, fetch_benchmark, align_data
 from core.rs_calculator import build_rs_summary
@@ -40,6 +43,31 @@ st.set_page_config(
     layout     = "wide",
     initial_sidebar_state = "expanded",
 )
+
+# ── Password gate ──────────────────────────────────────────────────
+def get_app_password() -> str:
+    try:
+        return st.secrets["APP_PASSWORD"]
+    except Exception:
+        return os.getenv("APP_PASSWORD", "")
+
+APP_PASSWORD = get_app_password()
+
+if APP_PASSWORD:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.markdown("## 📈 RS Screener")
+        st.markdown("Enter the password to continue.")
+        pwd = st.text_input("Password", type="password")
+        if st.button("Login", type="primary"):
+            if pwd == APP_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password. Try again.")
+        st.stop()
 
 # ── Custom CSS ─────────────────────────────────────────────────────
 st.markdown("""
