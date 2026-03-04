@@ -390,7 +390,6 @@ run_screener(
     ma_period   = cfg['ma_period'],
     run_id      = '{run_id}',
     conditions  = cfg['active_conditions'],
-    min_threshold = cfg['min_threshold'],
     delay_secs  = 0.3,
 )
 """
