@@ -27,11 +27,21 @@ from datetime import datetime
 
 BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS_DIR = os.path.join(BASE_DIR, "results", "manual")
-sys.path.insert(0, BASE_DIR)
 
-from core.data_fetcher  import fetch_stock, fetch_benchmark, align_data, get_nse_universe
-from core.rs_calculator import build_rs_summary
-from core.scorer        import assign_sector
+# Ensure BASE_DIR is on path for both direct execution and when imported as module
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+try:
+    # When imported as core.crossover_scanner (from app.py)
+    from core.data_fetcher  import fetch_stock, fetch_benchmark, align_data, get_nse_universe
+    from core.rs_calculator import build_rs_summary
+    from core.scorer        import assign_sector
+except ImportError:
+    # When run directly: python3 core/crossover_scanner.py
+    from data_fetcher  import fetch_stock, fetch_benchmark, align_data, get_nse_universe
+    from rs_calculator import build_rs_summary
+    from scorer        import assign_sector
 
 
 # ── Core crossover detection ───────────────────────────────────────
