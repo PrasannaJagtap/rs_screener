@@ -29,7 +29,8 @@ sys.path.insert(0, BASE_DIR)
 
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-from core.data_fetcher  import fetch_stock, fetch_benchmark, align_data
+from core.data_fetcher       import fetch_stock, fetch_benchmark, align_data
+from core.crossover_scanner  import run_crossover_scanner
 from core.rs_calculator import build_rs_summary
 from core.conditions    import DEFAULT_CONDITIONS
 from core.scorer        import clean_and_score
@@ -195,13 +196,21 @@ with st.sidebar:
     run_button = st.button("🚀 Run Full Screener", type="primary", use_container_width=True)
     st.caption("Takes ~25 min for full NSE universe")
 
+    st.markdown("---")
+    st.markdown('<p class="section-header">Crossover Scanner</p>', unsafe_allow_html=True)
+    cross_lookback = st.selectbox("Lookback (weeks)", [1, 2, 3, 4, 5], index=2, key="cross_lookback")
+    cross_min_rs   = st.slider("Min RS at crossover", -1.0, 0.5, -0.5, 0.1, key="cross_min_rs")
+    cross_top_n    = st.selectbox("Top N picks", [10, 15, 20, 30], index=2, key="cross_top_n")
+    cross_button   = st.button("🔀 Run Crossover Scanner", use_container_width=True, key="cross_btn")
+    st.caption("Takes ~25 min for full NSE universe")
+
 
 # ══════════════════════════════════════════════════════════════════
 # MAIN TABS
 # ══════════════════════════════════════════════════════════════════
 
-tab_results, tab_run, tab_sectors, tab_stock = st.tabs([
-    "📊 Results", "⚙️ Run Screener", "🏭 Sectors", "🔍 Stock Detail"
+tab_results, tab_run, tab_sectors, tab_stock, tab_cross = st.tabs([
+    "📊 Results", "⚙️ Run Screener", "🏭 Sectors", "🔍 Stock Detail", "🔀 Crossover"
 ])
 
 
@@ -732,3 +741,371 @@ with tab_stock:
 - `RELIANCE` — RS near zero, pullback mode
 - `INFY` — RS negative, IT sector weak
         """)
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 5 — CROSSOVER SCANNER
+# ══════════════════════════════════════════════════════════════════
+
+with tab_cross:
+    st.markdown("### 🔀 Crossover Scanner")
+    st.markdown("Finds stocks where **RS crossed above RS MA** recently — early momentum entry signal.")
+
+    st.markdown("---")
+
+    # ── Settings summary ──────────────────────────────────────────
+    st.info(
+        f"**Settings:** Lookback {cross_lookback} week{'s' if cross_lookback > 1 else ''} "
+        f"| Min RS at crossover: {cross_min_rs:+.1f} "
+        f"| Top picks: {cross_top_n} "
+        f"| Benchmark: {benchmark}"
+    )
+
+    if cross_button:
+
+        # ── Progress placeholders ──────────────────────────────────
+        cross_progress = st.progress(0)
+        cross_status   = st.empty()
+        cross_log      = st.empty()
+
+        cross_status.markdown("⏳ Fetching benchmark and scanning NSE universe...")
+
+        try:
+            # Run in-process but show a spinner
+            # We capture stdout via a subprocess so the progress bar can update
+            import tempfile, threading, queue
+
+            config_cross = {
+                "lookback"  : cross_lookback,
+                "min_rs"    : cross_min_rs,
+                "benchmark" : benchmark,
+                "rs_period" : rs_period,
+                "ma_period" : ma_period,
+            }
+            cross_config_path = os.path.join(BASE_DIR, ".cross_config.json")
+            cross_run_id      = datetime.today().strftime("%Y%m%d_%H%M")
+            cross_out_path    = os.path.join(
+                RESULTS_DIR, f"crossover_{cross_lookback}w_{cross_run_id}.csv"
+            )
+            cross_picks_path  = os.path.join(
+                RESULTS_DIR, f"top_picks_{cross_lookback}w_{cross_run_id}.csv"
+            )
+
+            with open(cross_config_path, "w") as f:
+                json.dump(config_cross, f)
+
+            cmd_cross = [
+                sys.executable, "-c",
+                f"""
+import sys, json
+sys.path.insert(0, '{BASE_DIR}')
+from core.crossover_scanner import run_crossover_scanner, save_results, save_top_picks, print_results
+
+with open('{cross_config_path}') as f:
+    cfg = json.load(f)
+
+df = run_crossover_scanner(
+    lookback   = cfg['lookback'],
+    min_rs     = cfg['min_rs'],
+    benchmark  = cfg['benchmark'],
+    rs_period  = cfg['rs_period'],
+    ma_period  = cfg['ma_period'],
+)
+if not df.empty:
+    df.to_csv('{cross_out_path}', index=False)
+
+    # Top picks
+    picks = df[
+        (df['sustained'] == True) &
+        (df['rs_now']    >  0.0)  &
+        (df['rs_gap']    >  0.02) &
+        (df['rs_slope']  >  0.0)
+    ].copy()
+    if not picks.empty:
+        picks['score'] = picks['rs_now']*0.4 + picks['rs_gap']*0.4 + picks['rs_slope']*0.2
+        picks = picks.sort_values('score', ascending=False).head({cross_top_n})
+
+        def conviction(row):
+            if row['rs_now'] > 0.5 and row['rs_gap'] > 0.1 and row['rs_slope'] > 0.1:
+                return 'HIGH'
+            elif row['rs_now'] > 0.2 and row['rs_gap'] > 0.05:
+                return 'MED'
+            else:
+                return 'WATCH'
+        picks['conviction'] = picks.apply(conviction, axis=1)
+        picks.to_csv('{cross_picks_path}', index=False)
+"""
+            ]
+
+            log_lines_cross = []
+            proc_cross = subprocess.Popen(
+                cmd_cross,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            for line in proc_cross.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                log_lines_cross.append(line)
+                # Update progress
+                if "%" in line and "/" in line:
+                    try:
+                        pct_str = line.split("(")[1].split("%")[0]
+                        pct = min(float(pct_str) / 100, 1.0)
+                        cross_progress.progress(pct)
+                    except Exception:
+                        pass
+                cross_log.code("\n".join(log_lines_cross[-15:]), language=None)
+
+            proc_cross.wait()
+            cross_progress.progress(1.0)
+
+            # ── Load and display results ───────────────────────────
+            if os.path.exists(cross_out_path):
+                cross_df    = pd.read_csv(cross_out_path)
+                cross_status.success(f"✅ Scan complete — {len(cross_df)} crossovers found")
+
+                # Load top picks if saved
+                picks_df = pd.DataFrame()
+                if os.path.exists(cross_picks_path):
+                    picks_df = pd.read_csv(cross_picks_path)
+
+                st.markdown("---")
+
+                # ── Summary metrics ────────────────────────────────
+                m1, m2, m3, m4 = st.columns(4)
+                sustained_n = len(cross_df[cross_df["sustained"] == True])
+                fresh_n     = len(cross_df[cross_df["sustained"] == False])
+                m1.metric("Total Crossovers", len(cross_df))
+                m2.metric("✅ Sustained",     sustained_n)
+                m3.metric("⏳ Fresh Only",    fresh_n)
+                m4.metric("🏆 Top Picks",     len(picks_df))
+
+                st.markdown("---")
+
+                # ══ TOP PICKS SECTION ════════════════════════════
+                st.markdown("## 🏆 Top Picks")
+                st.caption("Filtered: Sustained ✅ | RS > 0 | Gap > 0.02 | Slope rising | Ranked by composite score")
+
+                if picks_df.empty:
+                    st.warning("No stocks passed all quality filters. Try relaxing Min RS or increasing Lookback weeks.")
+                else:
+                    # Conviction filter
+                    conv_filter = st.radio(
+                        "Filter by conviction",
+                        ["All", "🔥 HIGH", "⭐ MED", "👀 WATCH"],
+                        horizontal=True,
+                        key="conv_filter"
+                    )
+
+                    show_picks = picks_df.copy()
+                    if conv_filter != "All":
+                        level = conv_filter.split(" ")[-1]  # HIGH / MED / WATCH
+                        show_picks = show_picks[show_picks["conviction"] == level]
+
+                    if show_picks.empty:
+                        st.info(f"No {conv_filter} conviction picks found.")
+                    else:
+                        # Conviction badge styling
+                        def style_conviction(val):
+                            colors = {"HIGH": "#16a34a", "MED": "#2563eb", "WATCH": "#d97706"}
+                            c = colors.get(val, "#6b7280")
+                            return f"background-color:{c};color:white;border-radius:4px;padding:2px 6px;font-weight:700"
+
+                        # Format for display
+                        disp = show_picks[[
+                            "symbol","conviction","rs_now","rs_gap",
+                            "rs_slope","cross_weeks_ago","close","sustained","sector"
+                        ]].copy()
+
+                        disp["cross_weeks_ago"] = disp["cross_weeks_ago"].apply(
+                            lambda x: "This week" if x == 1 else f"{int(x)}w ago"
+                        )
+                        disp["rs_now"]   = disp["rs_now"].apply(lambda x: f"{x:+.4f}")
+                        disp["rs_gap"]   = disp["rs_gap"].apply(lambda x: f"{x:+.4f}")
+                        disp["rs_slope"] = disp["rs_slope"].apply(lambda x: f"{x:+.4f}")
+                        disp["close"]    = disp["close"].apply(lambda x: f"₹{x:,.2f}")
+                        disp["sustained"]= disp["sustained"].apply(lambda x: "✅" if x else "⏳")
+
+                        disp.columns = [
+                            "Symbol","Conviction","RS Now","Gap",
+                            "Slope","Crossed","Close","Sustained","Sector"
+                        ]
+                        disp = disp.reset_index(drop=True)
+                        disp.index = disp.index + 1  # rank from 1
+
+                        st.dataframe(disp, use_container_width=True, height=400)
+
+                        # Download top picks
+                        st.download_button(
+                            "⬇️ Download Top Picks CSV",
+                            data      = picks_df.to_csv(index=False),
+                            file_name = f"top_picks_{cross_run_id}.csv",
+                            mime      = "text/csv",
+                            key       = "dl_picks"
+                        )
+
+                    # ── Conviction breakdown ───────────────────────
+                    st.markdown("---")
+                    st.markdown("#### Conviction Breakdown")
+                    ca, cb, cc = st.columns(3)
+                    high_n  = len(picks_df[picks_df["conviction"] == "HIGH"])
+                    med_n   = len(picks_df[picks_df["conviction"] == "MED"])
+                    watch_n = len(picks_df[picks_df["conviction"] == "WATCH"])
+                    ca.metric("🔥 HIGH",  high_n,  help="RS>0.5, Gap>0.1, Slope>0.1 — act first")
+                    cb.metric("⭐ MED",   med_n,   help="RS>0.2, Gap>0.05 — monitor closely")
+                    cc.metric("👀 WATCH", watch_n, help="Early stage — wait for confirmation")
+
+                    # ── Sector chart of top picks ──────────────────
+                    if not picks_df.empty:
+                        st.markdown("---")
+                        st.markdown("#### Sector Spread — Top Picks")
+                        sec_counts = picks_df["sector"].value_counts().reset_index()
+                        sec_counts.columns = ["Sector","Count"]
+                        fig_sec = px.bar(
+                            sec_counts, x="Count", y="Sector",
+                            orientation="h",
+                            color="Count",
+                            color_continuous_scale="Teal",
+                            title="Sectors in Top Picks",
+                        )
+                        fig_sec.update_layout(
+                            template="plotly_dark",
+                            paper_bgcolor="#0e1117",
+                            plot_bgcolor="#0e1117",
+                            showlegend=False,
+                            coloraxis_showscale=False,
+                            margin=dict(l=10,r=10,t=40,b=10),
+                            height=350,
+                        )
+                        st.plotly_chart(fig_sec, use_container_width=True)
+
+                st.markdown("---")
+
+                # ══ ALL CROSSOVERS SECTION ═══════════════════════
+                with st.expander(f"📋 All {len(cross_df)} Crossovers (full detail)", expanded=False):
+
+                    # Filters
+                    fa, fb, fc = st.columns(3)
+                    with fa:
+                        week_filter = st.multiselect(
+                            "Crossed",
+                            options=sorted(cross_df["cross_weeks_ago"].unique()),
+                            default=sorted(cross_df["cross_weeks_ago"].unique()),
+                            format_func=lambda x: "This week" if x == 1 else f"{int(x)} weeks ago",
+                            key="week_filter"
+                        )
+                    with fb:
+                        sust_filter = st.radio(
+                            "Sustained",
+                            ["All", "Sustained only", "Fresh only"],
+                            key="sust_filter"
+                        )
+                    with fc:
+                        rs_positive = st.checkbox("RS > 0 only", value=False, key="rs_pos_filter")
+
+                    all_disp = cross_df.copy()
+                    if week_filter:
+                        all_disp = all_disp[all_disp["cross_weeks_ago"].isin(week_filter)]
+                    if sust_filter == "Sustained only":
+                        all_disp = all_disp[all_disp["sustained"] == True]
+                    elif sust_filter == "Fresh only":
+                        all_disp = all_disp[all_disp["sustained"] == False]
+                    if rs_positive:
+                        all_disp = all_disp[all_disp["rs_now"] > 0]
+
+                    all_disp = all_disp.copy()
+                    all_disp["cross_weeks_ago"] = all_disp["cross_weeks_ago"].apply(
+                        lambda x: "This week" if x == 1 else f"{int(x)}w ago"
+                    )
+                    all_disp["rs_now"]    = all_disp["rs_now"].apply(lambda x: f"{x:+.4f}")
+                    all_disp["rs_gap"]    = all_disp["rs_gap"].apply(lambda x: f"{x:+.4f}")
+                    all_disp["rs_slope"]  = all_disp["rs_slope"].apply(lambda x: f"{x:+.4f}")
+                    all_disp["close"]     = all_disp["close"].apply(lambda x: f"₹{x:,.2f}")
+                    all_disp["sustained"] = all_disp["sustained"].apply(lambda x: "✅" if x else "⏳")
+                    all_disp = all_disp[[
+                        "symbol","rs_now","rs_ma_now","rs_gap","rs_slope",
+                        "cross_weeks_ago","close","sustained","sector"
+                    ]]
+                    all_disp.columns = [
+                        "Symbol","RS Now","RS MA","Gap","Slope",
+                        "Crossed","Close","Sustained","Sector"
+                    ]
+                    st.markdown(f"**{len(all_disp)} stocks** after filters")
+                    st.dataframe(all_disp, use_container_width=True, height=500)
+
+                    st.download_button(
+                        "⬇️ Download All Crossovers CSV",
+                        data      = cross_df.to_csv(index=False),
+                        file_name = f"crossover_{cross_run_id}.csv",
+                        mime      = "text/csv",
+                        key       = "dl_all_cross"
+                    )
+
+            else:
+                cross_status.error("❌ Scan failed or returned no results. Check log above.")
+
+        except Exception as e:
+            cross_status.error(f"Error: {e}")
+            st.exception(e)
+
+    else:
+        # Instruction state
+        st.markdown("""
+**How it works:**
+1. Adjust **Lookback weeks** and **Min RS** in the sidebar
+2. Click **🔀 Run Crossover Scanner**
+3. Wait ~25 minutes (same as full screener)
+4. Results show in two sections:
+
+| Section | What you'll see |
+|---|---|
+| 🏆 Top Picks | Filtered, ranked, conviction-tagged setups |
+| 📋 All Crossovers | Every stock with a recent RS/RSMA cross |
+        """)
+
+        st.markdown("---")
+        st.markdown("#### What to look for in Top Picks")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("""
+**🔥 HIGH conviction**
+- RS Now > 0.5
+- Gap above MA > 0.1
+- Slope still rising
+
+*Act on these first*
+            """)
+        with col2:
+            st.markdown("""
+**⭐ MED conviction**
+- RS Now > 0.2
+- Gap above MA > 0.05
+
+*Monitor closely,
+enter on pullback*
+            """)
+        with col3:
+            st.markdown("""
+**👀 WATCH**
+- Early stage crossover
+- Weak or flat slope
+
+*Wait for another
+week of confirmation*
+            """)
+
+        # Show most recent crossover file if exists
+        cross_files = sorted(
+            glob.glob(os.path.join(RESULTS_DIR, "crossover_*.csv")),
+            reverse=True
+        )
+        if cross_files:
+            latest_cross = cross_files[0]
+            st.markdown("---")
+            st.info(f"💡 Last scan: **{os.path.basename(latest_cross)}** — click Run to refresh")
