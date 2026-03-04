@@ -9,13 +9,14 @@ What it does each Saturday:
   2. Scores + grades results
   3. Exports to Excel
   4. Sends summary to Telegram
+  5. Pushes scored CSV to GitHub (so web app shows fresh results)
 
 Usage:
   python3 scheduler/auto_run.py          # start scheduler (runs in background)
   python3 scheduler/auto_run.py --now    # trigger one run immediately (for testing)
 """
 
-import os, sys, glob, argparse, logging
+import os, sys, glob, argparse, logging, subprocess
 import pandas as pd
 from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -26,11 +27,11 @@ LOG_DIR  = os.path.join(BASE_DIR, "logs")
 sys.path.insert(0, BASE_DIR)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-from core.screener        import run_screener
-from core.scorer          import clean_and_score
-from output.excel_exporter import export_to_excel
-from output.telegram      import send_results, send_message
-from core.conditions      import DEFAULT_CONDITIONS
+from core.screener          import run_screener
+from core.scorer            import clean_and_score
+from output.excel_exporter  import export_to_excel
+from output.telegram        import send_results, send_message
+from core.conditions        import DEFAULT_CONDITIONS
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -44,12 +45,10 @@ def setup_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
 
     if not logger.handlers:
-        # File handler
         fh = logging.FileHandler(log_file)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s | %(levelname)s | %(message)s"
         ))
-        # Console handler
         ch = logging.StreamHandler()
         ch.setFormatter(logging.Formatter(
             "%(asctime)s | %(message)s"
@@ -60,12 +59,72 @@ def setup_logger() -> logging.Logger:
     return logger
 
 
+# ── Git push results ───────────────────────────────────────────────
+
+def push_results_to_github(scored_path: str, run_id: str,
+                           logger: logging.Logger):
+    """
+    Push the scored CSV to GitHub so Streamlit Cloud shows fresh results.
+    Steps:
+      1. Force-add the scored CSV (bypasses .gitignore)
+      2. Remove older CSVs from git (keep latest 4 only)
+      3. Commit with run date
+      4. Push to origin main
+    """
+    try:
+        # Force-add the scored CSV (it's in .gitignore so we use -f)
+        subprocess.run(
+            ["git", "add", "-f", scored_path],
+            cwd=BASE_DIR, check=True, capture_output=True
+        )
+
+        # Remove older scored CSVs from git (keep only latest 4)
+        results_dir = os.path.join(BASE_DIR, "results", "manual")
+        old_csvs = sorted(
+            glob.glob(os.path.join(results_dir, "scored_*.csv")),
+            reverse=True
+        )[4:]
+        for old in old_csvs:
+            subprocess.run(
+                ["git", "rm", "--cached", old],
+                cwd=BASE_DIR, capture_output=True
+            )
+
+        # Commit
+        commit_msg = f"Results update — {datetime.today().strftime('%d %b %Y')}"
+        result = subprocess.run(
+            ["git", "commit", "-m", commit_msg],
+            cwd=BASE_DIR, capture_output=True, text=True
+        )
+
+        if "nothing to commit" in result.stdout:
+            logger.info("GitHub: nothing new to commit")
+            return
+
+        # Push
+        push = subprocess.run(
+            ["git", "push", "origin", "main"],
+            cwd=BASE_DIR, capture_output=True, text=True
+        )
+
+        if push.returncode == 0:
+            logger.info("GitHub: results pushed successfully")
+            logger.info("Streamlit Cloud will update within 1 minute")
+        else:
+            logger.warning(f"GitHub push failed: {push.stderr}")
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Git command failed: {e}")
+    except Exception as e:
+        logger.error(f"GitHub push error: {e}")
+
+
 # ── Full weekly run ────────────────────────────────────────────────
 
 def weekly_run():
     """
     Complete weekly pipeline:
-    screener → scorer → excel → telegram
+    screener -> scorer -> excel -> telegram -> github push
     """
     logger = setup_logger()
     run_id = datetime.today().strftime("%Y%m%d_%H%M")
@@ -74,11 +133,10 @@ def weekly_run():
     logger.info(f"WEEKLY RUN STARTED  |  Run ID: {run_id}")
     logger.info("=" * 55)
 
-    # Notify start
     send_message(f"⏳ <b>RS Screener starting...</b>\nRun ID: {run_id}")
 
-    # ── Step 1: Screener ───────────────────────────────────────────
-    logger.info("Step 1/4 — Running screener (2264 stocks)")
+    # Step 1: Screener
+    logger.info("Step 1/5 — Running screener (2264 stocks)")
     try:
         results_df = run_screener(
             benchmark   = "^CNX200",
@@ -100,15 +158,14 @@ def weekly_run():
         send_message("❌ <b>Screener returned no results</b>")
         return
 
-    # ── Step 2: Score ──────────────────────────────────────────────
-    logger.info("Step 2/4 — Scoring + grading results")
+    # Step 2: Score
+    logger.info("Step 2/5 — Scoring + grading results")
     try:
         scored_df = clean_and_score(results_df)
         grade_a   = len(scored_df[scored_df["grade"] == "A"])
         grade_b   = len(scored_df[scored_df["grade"] == "B"])
         logger.info(f"Scoring done — Grade A: {grade_a} | Grade B: {grade_b}")
 
-        # Save scored CSV
         scored_path = os.path.join(
             BASE_DIR, "results", "manual", f"scored_{run_id}.csv"
         )
@@ -119,17 +176,16 @@ def weekly_run():
         send_message(f"❌ <b>Scoring failed</b>\nError: {e}")
         return
 
-    # ── Step 3: Excel export ───────────────────────────────────────
-    logger.info("Step 3/4 — Exporting to Excel")
+    # Step 3: Excel
+    logger.info("Step 3/5 — Exporting to Excel")
     try:
         excel_path = export_to_excel(scored_df)
         logger.info(f"Excel saved: {os.path.basename(excel_path)}")
     except Exception as e:
         logger.error(f"Excel export failed: {e}")
-        # Non-fatal — continue to Telegram
 
-    # ── Step 4: Telegram ───────────────────────────────────────────
-    logger.info("Step 4/4 — Sending Telegram summary")
+    # Step 4: Telegram
+    logger.info("Step 4/5 — Sending Telegram summary")
     try:
         ok = send_results(scored_df)
         if ok:
@@ -139,7 +195,13 @@ def weekly_run():
     except Exception as e:
         logger.error(f"Telegram failed: {e}")
 
-    # ── Done ───────────────────────────────────────────────────────
+    # Step 5: Push to GitHub
+    logger.info("Step 5/5 — Pushing results to GitHub")
+    try:
+        push_results_to_github(scored_path, run_id, logger)
+    except Exception as e:
+        logger.error(f"GitHub push failed: {e}")
+
     elapsed_note = datetime.today().strftime("%d %b %Y %H:%M")
     logger.info(f"WEEKLY RUN COMPLETE  |  {elapsed_note}")
     logger.info("=" * 55)
@@ -152,7 +214,6 @@ def start_scheduler():
 
     scheduler = BlockingScheduler(timezone="Asia/Kolkata")
 
-    # Every Saturday at 8:00 AM IST
     scheduler.add_job(
         func    = weekly_run,
         trigger = CronTrigger(
@@ -161,8 +222,8 @@ def start_scheduler():
             minute      = 0,
             timezone    = "Asia/Kolkata",
         ),
-        id          = "weekly_rs_screener",
-        name        = "Weekly RS Screener",
+        id               = "weekly_rs_screener",
+        name             = "Weekly RS Screener",
         replace_existing = True,
     )
 
@@ -187,8 +248,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RS Screener Scheduler")
     parser.add_argument(
         "--now",
-        action  = "store_true",
-        help    = "Run the screener immediately (skip schedule)"
+        action = "store_true",
+        help   = "Run the screener immediately (skip schedule)"
     )
     args = parser.parse_args()
 
