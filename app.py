@@ -30,7 +30,6 @@ sys.path.insert(0, BASE_DIR)
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 from core.data_fetcher       import fetch_stock, fetch_benchmark, align_data
-from core.crossover_scanner  import run_crossover_scanner
 from core.rs_calculator import build_rs_summary
 from core.conditions    import DEFAULT_CONDITIONS
 from core.scorer        import clean_and_score
